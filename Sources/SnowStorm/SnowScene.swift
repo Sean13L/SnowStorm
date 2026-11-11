@@ -101,6 +101,11 @@ final class PileState {
     var nextIcicle: TimeInterval
     var icicles: [Icicle] = []
     let capJitter = CGFloat.random(in: 0.8...1.0)
+    /// Fixed random phases for this pile's drifts, so its shape stays put as it fills.
+    private let driftPhases = (0..<4).map { _ in CGFloat.random(in: 0...(2 * .pi)) }
+    /// Height-limit multiplier per column: deep drifts and shallow dips plus small
+    /// lumps, so a full pile looks like real snow instead of a level shelf.
+    private(set) var drift: [CGFloat] = []
     /// Snow that arrived where the pile was already full; released bit by bit as falling clumps.
     var overflow: CGFloat = 0
     var nextSpill: TimeInterval = 0
@@ -192,6 +197,17 @@ final class PileState {
         drops = []
         slopeCaps = []
         cornerFill = []
+        // Based on position in points, so a resized pile keeps the same drifts.
+        // The bottom-of-screen bank gets big drifts; window tops a subtle wave.
+        let ground = surface.kind == .ground
+        let (big, lumps): (CGFloat, CGFloat) = ground ? (0.5, 0.22) : (0.16, 0.08)
+        let p = driftPhases
+        drift = (0..<heights.count).map { c in
+            let x = (CGFloat(c) + 0.5) * pileColumnWidth
+            let wave = 0.6 * sin(x / 70 + p[0]) + 0.4 * sin(x / 29 + p[1])        // -1...1
+            let lump = 0.6 * sin(x / 8.5 + p[2]) + 0.4 * sin(x / 4.3 + p[3])     // -1...1
+            return 1 - big * (0.5 - 0.5 * wave) - lumps * (0.5 - 0.5 * lump)
+        }
         for c in 0..<heights.count {
             let x = min(w, (CGFloat(c) + 0.5) * pileColumnWidth)
             let d = max(0, min(x, w - x))
@@ -220,7 +236,7 @@ final class PileState {
             visible = Array(repeating: true, count: n)
         }
         computeProfile(width: width)
-        for c in 0..<n { heights[c] = min(heights[c], surface.kind.maxPile * slopeCaps[c] + cornerFill[c]) }
+        for c in 0..<n { heights[c] = min(heights[c], surface.kind.maxPile * slopeCaps[c] * drift[c] + cornerFill[c]) }
         shapeChanged = true
     }
 }
@@ -568,7 +584,7 @@ final class SnowScene: SKScene {
         let maxH = pile.surface.kind.maxPile * pile.capJitter
         let n = pile.heights.count
         let edge = CGFloat(min(c, n - 1 - c)) * pileColumnWidth + pileColumnWidth / 2
-        return maxH * min(1, sqrt(edge / (maxH * 1.2))) * pile.slopeCaps[c] + pile.cornerFill[c]
+        return maxH * min(1, sqrt(edge / (maxH * 1.2))) * pile.slopeCaps[c] * pile.drift[c] + pile.cornerFill[c]
     }
 
     private func deposit(on pile: PileState, column c0: Int, amount: CGFloat) {
@@ -578,7 +594,10 @@ final class SnowScene: SKScene {
             guard c >= 0, c < n else { continue }
             let cap = capacity(of: pile, column: c)
             let before = pile.heights[c]
-            let filled = before + amount * exp(-CGFloat(k * k) / 4) * 0.45
+            // Drifts gather snow faster than dips, so the uneven shape shows while the
+            // pile is still filling, not only once it's full.
+            let d = pile.drift[c]
+            let filled = before + amount * exp(-CGFloat(k * k) / 4) * 0.45 * d * d
             if filled > cap { pile.overflow += filled - cap }
             pile.heights[c] = min(cap, filled)
             // A full spot that only adds to the overflow hasn't changed shape.
