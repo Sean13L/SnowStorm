@@ -15,14 +15,60 @@ struct Surface: Equatable {
 struct ScreenGeometry: Sendable {
     let frames: [CGRect]
     let visibleFrames: [CGRect]
+    /// Each screen's display UUID, as the window server names displays in its Spaces list.
+    var displayUUIDs: [String] = []
     var primaryHeight: CGFloat { frames.first?.height ?? 0 }
 
     @MainActor static func current() -> ScreenGeometry {
-        ScreenGeometry(frames: NSScreen.screens.map(\.frame), visibleFrames: NSScreen.screens.map(\.visibleFrame))
+        let screens = NSScreen.screens
+        return ScreenGeometry(frames: screens.map(\.frame), visibleFrames: screens.map(\.visibleFrame),
+                              displayUUIDs: screens.map(FullScreenSpaces.uuid(of:)))
     }
     /// Converts a top-left-origin rect (CoreGraphics / AX) into Cocoa coordinates.
     func cocoaRect(fromTopLeft r: CGRect) -> CGRect {
         CGRect(x: r.minX, y: primaryHeight - r.maxY, width: r.width, height: r.height)
+    }
+}
+
+/// Which displays are currently showing a native full-screen Space.
+///
+/// A native full-screen window and a "Fill"-tiled window can have exactly the same
+/// frame (on notched Macs both start just below the menu bar), so geometry can't tell
+/// them apart. The window server's Space list can: each display's current Space has a
+/// type, 0 for a normal desktop and 4 for a full-screen app. These are private
+/// SkyLight calls (no permission needed), looked up at runtime so that if a future
+/// macOS drops them, SnowStorm falls back to the geometry check instead of crashing.
+enum FullScreenSpaces {
+    private typealias MainConnection = @convention(c) () -> Int32
+    private typealias CopyDisplaySpaces = @convention(c) (Int32) -> Unmanaged<CFArray>?
+    private static let fullScreenType = 4
+
+    private static let functions: (MainConnection, CopyDisplaySpaces)? = {
+        let handle = dlopen(nil, RTLD_NOW)
+        guard let conn = dlsym(handle, "CGSMainConnectionID"),
+              let copy = dlsym(handle, "CGSCopyManagedDisplaySpaces") else { return nil }
+        return (unsafeBitCast(conn, to: MainConnection.self), unsafeBitCast(copy, to: CopyDisplaySpaces.self))
+    }()
+
+    @MainActor static func uuid(of screen: NSScreen) -> String {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+              let uuid = CGDisplayCreateUUIDFromDisplayID(number)?.takeRetainedValue() else { return "" }
+        return CFUUIDCreateString(nil, uuid) as String? ?? ""
+    }
+
+    /// Display UUIDs showing a full-screen Space ("Main" when all displays share one
+    /// set of Spaces), or nil if the window server couldn't be asked.
+    nonisolated static func displays() -> Set<String>? {
+        guard let (conn, copy) = functions,
+              let list = copy(conn())?.takeRetainedValue() as? [[String: Any]] else { return nil }
+        var result = Set<String>()
+        for display in list {
+            let current = display["Current Space"] as? [String: Any]
+            if current?["type"] as? Int == fullScreenType, let id = display["Display Identifier"] as? String {
+                result.insert(id)
+            }
+        }
+        return result
     }
 }
 
@@ -58,9 +104,6 @@ final class SurfaceTracker {
     /// 8 pt from the screen edge and 8 pt under the menu bar, so the card is the cell
     /// inset by 8, which gives the system's even 16-pt spacing between widgets.
     nonisolated static let widgetCardInset: CGFloat = 8
-    /// How far below the top of the screen a full-screen window may start: the menu
-    /// bar or notch strip (33 pt on a notched MacBook, 24-25 pt elsewhere).
-    nonisolated static let fullScreenTopAllowance: CGFloat = 40
 
     nonisolated private static let widgetOwners: Set<String> = [
         "NotificationCenter", "Notification Center", "Notification Centre", "Widgets", "chronod",
@@ -115,6 +158,13 @@ final class SurfaceTracker {
         var result: [Surface] = []
         var covered: [CGRect] = []
         var decided: [CGRect] = []   // screens whose front-most big window was already seen
+        // Native full screen (videos, apps): the display is showing a full-screen Space.
+        if let full = FullScreenSpaces.displays(), !full.isEmpty {
+            for (frame, uuid) in zip(screens, geometry.displayUUIDs)
+            where full.contains("Main") || full.contains(uuid) {
+                covered.append(frame)
+            }
+        }
         var index = 0
         for w in info {
             guard let pid = w[kCGWindowOwnerPID as String] as? Int32, pid != myPID else { continue }
@@ -137,17 +187,16 @@ final class SurfaceTracker {
                 continue
             }
             var rect = geometry.cocoaRect(fromTopLeft: bounds)
-            // Full screen: the front-most big window on a screen spans its whole width and
-            // height, except the menu bar strip. On notched Macs a native full-screen
-            // window stops below the notch, so it never covers the very top. Small
-            // windows in front (a player's hover toolbar) don't decide it.
+            // Borderless full screen (some games and players don't use a full-screen
+            // Space): the front-most big window covers the whole screen, menu bar
+            // included, which no ordinary or "Fill"-tiled window can do. Small windows
+            // in front (a player's hover toolbar) don't decide it.
             if kind == .window {
                 for s in screens where !decided.contains(s) {
                     let hit = rect.intersection(s)
                     guard hit.width * hit.height >= s.width * s.height * 0.4 else { continue }
                     decided.append(s)
-                    if hit.minX <= s.minX + 1, hit.maxX >= s.maxX - 1, hit.minY <= s.minY + 1,
-                       hit.maxY >= s.maxY - fullScreenTopAllowance {
+                    if hit.contains(s.insetBy(dx: 1, dy: 1)), !covered.contains(s) {
                         covered.append(s)
                     }
                 }
