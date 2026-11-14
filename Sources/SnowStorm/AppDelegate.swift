@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tracker.onUpdate = { [weak self] surfaces in
             self?.overlays.forEach { $0.scene.apply(surfaces: surfaces) }
         }
+        tracker.onFullScreenChange = { [weak self] _ in self?.updateFullScreen() }
         rebuildOverlays()
         tracker.start()
 
@@ -40,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         nc.addObserver(forName: Settings.didChange, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.overlays.forEach { $0.scene.settingsChanged() }
+                self?.updateFullScreen()
                 self?.tracker.republish()
             }
         }
@@ -49,7 +51,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildOverlays() {
         overlays.forEach { $0.tearDown() }
         overlays = NSScreen.screens.map { OverlayController(screen: $0) }
+        updateFullScreen()
         tracker.republish()
+    }
+
+    /// Hides the snow on each screen where something is full screen (if enabled).
+    private func updateFullScreen() {
+        let hide = settings.hideInFullScreen
+        let covered = tracker.fullScreenFrames
+        for o in overlays {
+            o.setAllowedInFullScreenSpaces(!hide)
+            o.setSuppressed(hide && covered.contains(o.screen.frame))
+        }
     }
 
     private func promptForAccessibilityOnce() {
@@ -78,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         balls.isEnabled = settings.snowman
         menu.addItem(balls)
         menu.addItem(item("Icicles", #selector(toggleIcicles), on: settings.icicles))
+        menu.addItem(item("Hide During Full Screen", #selector(toggleHideInFullScreen), on: settings.hideInFullScreen))
 
         let lands = NSMenuItem(title: "Snow Lands On", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -118,6 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleSnowman() { settings.snowman.toggle() }
     @objc private func toggleSnowballs() { settings.snowballs.toggle() }
     @objc private func toggleIcicles() { settings.icicles.toggle() }
+    @objc private func toggleHideInFullScreen() { settings.hideInFullScreen.toggle() }
     @objc private func toggleSurface(_ sender: NSMenuItem) {
         let kind = SurfaceKind.allCases[sender.tag]
         settings.setSurface(kind, enabled: !settings.surfaceEnabled(kind))

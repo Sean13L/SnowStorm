@@ -93,6 +93,7 @@ final class Settings {
             "snowman": true,
             "snowballs": true,
             "icicles": true,
+            "hideInFullScreen": true,
         ]
         for kind in SurfaceKind.allCases { initial["surface.\(kind.rawValue)"] = true }
         defaults.register(defaults: initial)
@@ -117,6 +118,12 @@ final class Settings {
     var icicles: Bool {
         get { defaults.bool(forKey: "icicles") }
         set { defaults.set(newValue, forKey: "icicles"); changed() }
+    }
+
+    /// Clear the snow off a screen while a video, game or app is full screen there.
+    var hideInFullScreen: Bool {
+        get { defaults.bool(forKey: "hideInFullScreen") }
+        set { defaults.set(newValue, forKey: "hideInFullScreen"); changed() }
     }
 
     func surfaceEnabled(_ kind: SurfaceKind) -> Bool {

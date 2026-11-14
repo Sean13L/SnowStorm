@@ -100,6 +100,35 @@ final class OverlayController {
         scene.onSnowmanAreaChange = { [weak self] areas in self?.updateClickArea(areas) }
     }
 
+    /// True while something is full screen here and the snow has stepped aside.
+    private(set) var isSuppressed = false
+
+    /// Takes the snow off this screen (or brings it back). Rendering pauses too, so a
+    /// full-screen video or game pays nothing for it, and the piles are kept as they were.
+    func setSuppressed(_ suppressed: Bool) {
+        guard suppressed != isSuppressed else { return }
+        isSuppressed = suppressed
+        renderView?.setPaused(suppressed)
+        skView?.isPaused = suppressed
+        if suppressed {
+            window.orderOut(nil)
+            clickPanel.orderOut(nil)
+        } else {
+            window.orderFrontRegardless()
+            if !clickView.circles.isEmpty { clickPanel.orderFrontRegardless() }
+        }
+    }
+
+    /// Whether the overlay may appear on a native full-screen Space at all. Leaving it
+    /// off lets the window server keep snow out the instant a full-screen Space opens,
+    /// before the next window poll notices.
+    func setAllowedInFullScreenSpaces(_ allowed: Bool) {
+        var b = Self.behavior
+        if !allowed { b.remove(.fullScreenAuxiliary) }
+        window.collectionBehavior = b
+        clickPanel.collectionBehavior = b
+    }
+
     func tearDown() {
         clickPanel.orderOut(nil)
         window.orderOut(nil)
@@ -109,6 +138,7 @@ final class OverlayController {
 
     private func updateClickArea(_ areas: [CGRect]) {
         guard let first = areas.first else {
+            clickView.circles = []
             clickPanel.orderOut(nil)
             return
         }
@@ -116,7 +146,7 @@ final class OverlayController {
         clickPanel.setFrame(union.offsetBy(dx: screen.frame.minX, dy: screen.frame.minY), display: false)
         clickView.frame = NSRect(origin: .zero, size: union.size)
         clickView.circles = areas.map { $0.offsetBy(dx: -union.minX, dy: -union.minY) }
-        if !clickPanel.isVisible { clickPanel.orderFrontRegardless() }
+        if !isSuppressed, !clickPanel.isVisible { clickPanel.orderFrontRegardless() }
     }
 
     private func handleClick(windowPoint p: NSPoint) {

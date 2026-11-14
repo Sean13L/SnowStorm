@@ -35,7 +35,10 @@ struct ScreenGeometry: Sendable {
 @MainActor
 final class SurfaceTracker {
     var onUpdate: (([Surface]) -> Void)?
+    /// Called with the frames of screens an app window currently covers edge to edge.
+    var onFullScreenChange: (([CGRect]) -> Void)?
     private(set) var surfaces: [Surface] = []
+    private(set) var fullScreenFrames: [CGRect] = []
 
     private var windowSurfaces: [Surface] = []
     private var axSurfaces: [Surface] = []
@@ -55,6 +58,9 @@ final class SurfaceTracker {
     /// 8 pt from the screen edge and 8 pt under the menu bar, so the card is the cell
     /// inset by 8, which gives the system's even 16-pt spacing between widgets.
     nonisolated static let widgetCardInset: CGFloat = 8
+    /// How far below the top of the screen a full-screen window may start: the menu
+    /// bar or notch strip (33 pt on a notched MacBook, 24-25 pt elsewhere).
+    nonisolated static let fullScreenTopAllowance: CGFloat = 40
 
     nonisolated private static let widgetOwners: Set<String> = [
         "NotificationCenter", "Notification Center", "Notification Centre", "Widgets", "chronod",
@@ -85,22 +91,30 @@ final class SurfaceTracker {
         let geometry = ScreenGeometry.current()
         let pid = myPID
         windowQueue.async { [weak self] in
-            let result = Self.readWindows(geometry: geometry, myPID: pid)
+            let (result, covered) = Self.readWindows(geometry: geometry, myPID: pid)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.windowPollBusy = false
                     self.windowSurfaces = result
+                    if covered != self.fullScreenFrames {
+                        self.fullScreenFrames = covered
+                        self.onFullScreenChange?(covered)
+                    }
                     self.publish(force: false)
                 }
             }
         }
     }
 
-    nonisolated private static func readWindows(geometry: ScreenGeometry, myPID: Int32) -> [Surface] {
-        guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return [] }
+    /// Returns the surfaces, plus the frames of screens that an app window covers
+    /// completely, menu bar included: a full-screen video, game, slideshow or app.
+    nonisolated private static func readWindows(geometry: ScreenGeometry, myPID: Int32) -> ([Surface], [CGRect]) {
+        guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return ([], []) }
         let screens = geometry.frames
         var result: [Surface] = []
+        var covered: [CGRect] = []
+        var decided: [CGRect] = []   // screens whose front-most big window was already seen
         var index = 0
         for w in info {
             guard let pid = w[kCGWindowOwnerPID as String] as? Int32, pid != myPID else { continue }
@@ -123,6 +137,21 @@ final class SurfaceTracker {
                 continue
             }
             var rect = geometry.cocoaRect(fromTopLeft: bounds)
+            // Full screen: the front-most big window on a screen spans its whole width and
+            // height, except the menu bar strip. On notched Macs a native full-screen
+            // window stops below the notch, so it never covers the very top. Small
+            // windows in front (a player's hover toolbar) don't decide it.
+            if kind == .window {
+                for s in screens where !decided.contains(s) {
+                    let hit = rect.intersection(s)
+                    guard hit.width * hit.height >= s.width * s.height * 0.4 else { continue }
+                    decided.append(s)
+                    if hit.minX <= s.minX + 1, hit.maxX >= s.maxX - 1, hit.minY <= s.minY + 1,
+                       hit.maxY >= s.maxY - fullScreenTopAllowance {
+                        covered.append(s)
+                    }
+                }
+            }
             // A widget host that covers a whole screen isn't a single widget; skip it.
             if kind == .widget, screens.contains(where: { rect.width >= $0.width * 0.9 && rect.height >= $0.height * 0.9 }) { continue }
             // Snow belongs on the visible card, not the cell's invisible margin, and the
@@ -134,7 +163,7 @@ final class SurfaceTracker {
             result.append(Surface(id: "w\(number)", kind: kind, rect: rect,
                                   order: kind == .window ? index : 10_000 + index))
         }
-        return result
+        return (result, covered)
     }
 
     // MARK: Accessibility (Dock and desktop icons)
@@ -195,15 +224,51 @@ final class SurfaceTracker {
                 }
             }
         }
-        // Without permission, infer the Dock from the space it reserves on screen.
-        // The exact width isn't knowable this way, so assume a centered strip.
+        // Without permission, infer the Dock from the space it reserves on screen, and
+        // estimate its length from what's in it, so it grows and shrinks with the Dock.
+        let tiles = dockTileCount()
         for (f, v) in zip(geometry.frames, geometry.visibleFrames) {
             let bottom = v.minY - f.minY, left = v.minX - f.minX, right = f.maxX - v.maxX
-            if bottom > 4 { return CGRect(x: f.minX + f.width * 0.25, y: f.minY, width: f.width * 0.5, height: bottom) }
-            if left > 4 { return CGRect(x: f.minX, y: f.minY + f.height * 0.25, width: left, height: f.height * 0.5) }
-            if right > 4 { return CGRect(x: f.maxX - right, y: f.minY + f.height * 0.25, width: right, height: f.height * 0.5) }
+            if bottom > 4 {
+                let w = min(f.width - 8, estimatedDockLength(tiles: tiles, thickness: bottom))
+                return CGRect(x: f.midX - w / 2, y: f.minY, width: w, height: bottom)
+            }
+            if left > 4 || right > 4 {
+                let t = max(left, right)
+                let h = min(f.height - 8, estimatedDockLength(tiles: tiles, thickness: t))
+                return CGRect(x: left > 4 ? f.minX : f.maxX - t, y: f.midY - h / 2, width: t, height: h)
+            }
         }
         return nil
+    }
+
+    /// Icons in the Dock: Finder, pinned apps, running apps that aren't pinned, recent
+    /// apps, pinned folders/files and the Trash, plus the separators between sections.
+    nonisolated static func dockTileCount() -> (icons: Int, separators: Int) {
+        let prefs = UserDefaults(suiteName: "com.apple.dock")
+        func items(_ key: String) -> [[String: Any]] { prefs?.array(forKey: key) as? [[String: Any]] ?? [] }
+        func bundleID(_ tile: [String: Any]) -> String? {
+            (tile["tile-data"] as? [String: Any])?["bundle-identifier"] as? String
+        }
+        let pinned = items("persistent-apps")
+        let pinnedIDs = Set(pinned.compactMap(bundleID))
+        let showRecents = prefs?.object(forKey: "show-recents") as? Bool ?? true
+        let recents = showRecents ? items("recent-apps").compactMap(bundleID).filter { !pinnedIDs.contains($0) } : []
+        let unpinnedRunning = NSWorkspace.shared.runningApplications.filter {
+            guard $0.activationPolicy == .regular, let id = $0.bundleIdentifier else { return false }
+            return id != "com.apple.finder" && !pinnedIDs.contains(id) && !recents.contains(id)
+        }.count
+        let others = items("persistent-others").count
+        let icons = 1 + pinned.count + recents.count + unpinnedRunning + others + 1   // Finder ... Trash
+        let separators = 1 + ((recents.count + unpinnedRunning) > 0 && showRecents ? 1 : 0)
+        return (icons, separators)
+    }
+
+    /// Dock length from its icon count and its thickness (the space it reserves).
+    /// Measured on macOS 26: 22 icons and one separator in an 85-pt-tall Dock span
+    /// 1416 pt, i.e. about 0.735 × thickness per icon plus half a thickness of ends.
+    nonisolated static func estimatedDockLength(tiles: (icons: Int, separators: Int), thickness: CGFloat) -> CGFloat {
+        thickness * (0.735 * CGFloat(tiles.icons) + 0.25 * CGFloat(tiles.separators) + 0.25)
     }
 
     nonisolated static func desktopIcons(geometry: ScreenGeometry) -> [(id: String, rect: CGRect)] {

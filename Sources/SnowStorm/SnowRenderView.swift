@@ -95,6 +95,9 @@ final class SnowRenderView: NSView {
         link?.preferredFrameRateRange = CAFrameRateRange(minimum: f, maximum: f, preferred: f)
     }
 
+    /// Stops drawing (and the scene's clock) without tearing anything down.
+    func setPaused(_ paused: Bool) { link?.isPaused = paused }
+
     func stop() {
         link?.invalidate()
         link = nil
